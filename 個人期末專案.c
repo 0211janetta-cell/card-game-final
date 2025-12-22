@@ -1,10 +1,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <string.h>
+#include <unistd.h>
 
 /* ====== 常數設定 ====== */
 #define NUM_CARDS 52
 #define HAND_SIZE 7
+
+/* ====== 顏色 ====== */
+#define C_RESET   "\033[0m"
+#define C_BOLD    "\033[1m"
+#define C_RED     "\033[31m"
+#define C_GREEN   "\033[32m"
+#define C_YELLOW  "\033[33m"
+#define C_MAG     "\033[35m"
+#define C_CYAN    "\033[36m"
 
 /* 花色：0 = ♠, 1 = ♥, 2 = ♣, 3 = ♦ */
 typedef struct {
@@ -53,6 +64,15 @@ typedef enum {
     HAND_STRAIGHT_FLUSH,  // 同花順
 } HandType;
 
+/* 音效播放（避免疊音版） */
+void playSound(const char *path) {
+    system("killall afplay >/dev/null 2>&1");   // 先停掉上一個正在播的 afplay
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "afplay \"%s\" >/dev/null 2>&1 &", path);
+    system(cmd);
+}
+
 /* 初始化遊戲：配置記憶體、設定初始狀態（但不洗牌、不發牌） */
 void initGame(GameState *game);
 
@@ -85,7 +105,7 @@ const char *handTypeName(HandType type);
 const char *suitSymbol(int s);
 
 /* 根據出的牌來計分（之後實作牌型判斷邏輯） */
-double evaluateHand(Card *played, int playedCount, const GameState *game);
+double evaluateHand(Card *played, int playedCount, const GameState *game, int *outHasBoost);
 
 /* 移除手牌中剛剛打出的牌，並從牌堆補到 7 張 */
 void updateHandAfterPlay(GameState *game, Card *played, int playedCount);
@@ -93,16 +113,18 @@ void updateHandAfterPlay(GameState *game, Card *played, int playedCount);
 /* 主遊戲迴圈：這一關從開始玩到結束（過關或失敗） */
 int playLevel(GameState *game);
 
-/* Basic Magic Card 系統 */
 void chooseMagicCard(GameState *game);
+
 void applySuitChangeMagic(GameState *game);
+
 void tryUseDrawBoost(GameState *game);
 
 void shopSystem(GameState *game);
 
+void waitEnter(void);
+
 /* 釋放動態記憶體 */
 void freeGame(GameState *game);
-
 
 
 /* ====== main 函式 ====== */
@@ -302,31 +324,184 @@ void dealInitialHand(GameState *game) {
     }
 }
 
+void waitEnter(void){
+    int ch;
+
+    // 清掉前一次 scanf 留下的殘留（通常是 '\n'）
+    while ((ch = getchar()) != '\n' && ch != EOF) {}
+
+    printf("\n%s按 Enter 繼續...%s", C_YELLOW, C_RESET);
+    fflush(stdout);
+
+    // 等玩家按 Enter（讀到 '\n' 才結束）
+    while ((ch = getchar()) != '\n' && ch != EOF) {}
+
+    printf("\n");
+}
+
 void printCard(const Card *c) {
     char *suitChar;
+    const char *color;
     switch (c->suit) {
-        case 0: suitChar = "♠"; break; // Spade ♠
-        case 1: suitChar = "♥"; break; // Heart ♥
-        case 2: suitChar = "♣"; break; // Club ♣
-        case 3: suitChar = "♦"; break; // Diamond ♦
-        default: suitChar = "?"; break;
+        case 0: suitChar = "♠"; color = C_CYAN; break;
+        case 1: suitChar = "♥"; color = C_RED;  break;
+        case 2: suitChar = "♣"; color = C_CYAN; break;
+        case 3: suitChar = "♦"; color = C_RED;  break;
+        default: suitChar = "?"; color = "";    break;
     }
 
     const char *rankStr;
+    static char buf[3];
     switch (c->rank) {
-        case 1:  rankStr = "A";  break;
-        case 11: rankStr = "J";  break;
-        case 12: rankStr = "Q";  break;
-        case 13: rankStr = "K";  break;
-        default: {
-            static char buf[3];
+        case 1:  rankStr = "A"; break;
+        case 11: rankStr = "J"; break;
+        case 12: rankStr = "Q"; break;
+        case 13: rankStr = "K"; break;
+        default:
             snprintf(buf, sizeof(buf), "%d", c->rank);
             rankStr = buf;
-            break;
-        }
     }
 
-    printf("%s%s", suitChar, rankStr);
+    printf("%s%s%s%s", color, suitChar, rankStr, C_RESET);
+}
+
+/* 取得花色顏色（紅/青） */
+const char *suitColor(int suit){
+    if (suit == 1 || suit == 3) return C_RED;   // ♥ ♦
+    return C_CYAN;                               // ♠ ♣
+}
+
+/* 取得點數字串（A,2..10,J,Q,K） */
+const char *rankText(int rank){
+    static char buf[3];
+    switch(rank){
+        case 1:  return "A";
+        case 11: return "J";
+        case 12: return "Q";
+        case 13: return "K";
+        default:
+            snprintf(buf, sizeof(buf), "%d", rank);
+            return buf;
+    }
+}
+
+/* 印 n 個空白 */
+static void printSpaces(int n){
+    for(int i=0;i<n;i++) putchar(' ');
+}
+
+/*
+ * 印單張卡牌的某一行（line=0~4）
+ * selected=1 → 框線與index用 黃+粗體
+ */
+void printCardBoxLineSelected(const Card *c, int idx, int line, int selected){
+    const char *s = suitSymbol(c->suit);
+    const char *r = rankText(c->rank);
+
+    const char *faceCol = suitColor(c->suit);               // 牌面紅/青
+    const char *boxCol  = selected ? C_YELLOW : C_RESET;    // 框線顏色
+    const char *boxBold = selected ? C_BOLD   : "";         // 框線粗體
+
+    // 牌面可視長度：suit(1) + rank(1或2)
+    int rankLen = (c->rank == 10) ? 2 : 1;
+    int visLen = 1 + rankLen;
+    int innerW = 5; // 框內寬度
+    int leftPad  = (innerW - visLen) / 2;
+    int rightPad = innerW - visLen - leftPad;
+
+    if (line == 0) {
+        printf("%s%s┌─────┐%s", boxCol, boxBold, C_RESET);
+    } else if (line == 1) {
+        // index行：被選中就黃粗體
+        printf("%s%s│ [%d] │%s", boxCol, boxBold, idx, C_RESET);
+    } else if (line == 2) {
+        // 牌面：框線用box色，牌面用紅/青
+        printf("%s%s│%s", boxCol, boxBold, C_RESET);
+        printSpaces(leftPad);
+        printf("%s%s%s%s", faceCol, s, r, C_RESET);
+        printSpaces(rightPad);
+        printf("%s%s│%s", boxCol, boxBold, C_RESET);
+    } else if (line == 3) {
+        printf("%s%s│     │%s", boxCol, boxBold, C_RESET);
+    } else { // line == 4
+        printf("%s%s└─────┘%s", boxCol, boxBold, C_RESET);
+    }
+}
+
+/*
+ * 印整副手牌（橫向框框）
+ * selected[i]=1 → 第 i 張高亮（黃+粗體框線）
+ */
+void printHandBoxedSelected(const Card *hand, const int selected[HAND_SIZE]){
+    printf("你的手牌：\n");
+    for (int line = 0; line < 5; line++){
+        for (int i = 0; i < HAND_SIZE; i++){
+            int sel = selected ? selected[i] : 0;
+            printCardBoxLineSelected(&hand[i], i, line, sel);
+            printf(" ");
+        }
+        printf("\n");
+    }
+}
+
+/* 沒有選取狀態時的簡化版（全都不高亮） */
+void printHandBoxed(const Card *hand){
+    int dummy[HAND_SIZE] = {0};
+    printHandBoxedSelected(hand, dummy);
+}
+
+/* 印 3 張候選卡（橫向框框） */
+void print3CardsBoxed(const Card cards[3]) {
+    for (int line = 0; line < 5; line++) {
+        for (int i = 0; i < 3; i++) {
+            // 這裡 selected 一律 0，代表不高亮
+            printCardBoxLineSelected(&cards[i], i, line, 0);
+            printf(" ");
+        }
+        printf("\n");
+    }
+}
+
+/* ===== Suit 選擇框框（4個） ===== */
+/* 印單個 suit 選擇框框的某一行（line=0~4）
+ * selected=1 → 黃框粗體
+ */
+void printSuitBoxLineSelected(int suit, int idx, int line, int selected){
+    const char *sym = suitSymbol(suit);      // 方案A：回傳純符號 "♠"
+    const char *faceCol = suitColor(suit);   // 紅/青
+    const char *boxCol  = selected ? C_YELLOW : C_RESET;
+    const char *boxBold = selected ? C_BOLD   : "";
+
+    if (line == 0) {
+        printf("%s%s┌─────┐%s", boxCol, boxBold, C_RESET);
+    } else if (line == 1) {
+        printf("%s%s│ [%d] │%s", boxCol, boxBold, idx, C_RESET);
+    } else if (line == 2) {
+        // 中間放花色符號
+        printf("%s%s│%s", boxCol, boxBold, C_RESET);
+        printf("  "); // 左邊兩格
+        printf("%s%s%s", faceCol, sym, C_RESET);
+        printf("  "); // 右邊兩格
+        printf("%s%s│%s", boxCol, boxBold, C_RESET);
+    } else if (line == 3) {
+        printf("%s%s│     │%s", boxCol, boxBold, C_RESET);
+    } else { // line == 4
+        printf("%s%s└─────┘%s", boxCol, boxBold, C_RESET);
+    }
+}
+
+/* 印 4 個 suit 選項（橫向框框）
+ * selectedSuit = -1 表示都不亮；0~3 表示那個亮黃框
+ */
+void printSuitOptionsBoxed(int selectedSuit){
+    for(int line = 0; line < 5; line++){
+        for(int s = 0; s < 4; s++){
+            int sel = (s == selectedSuit);
+            printSuitBoxLineSelected(s, s, line, sel);
+            printf(" ");
+        }
+        printf("\n");
+    }
 }
 
 void printHand(const Card *hand) {
@@ -351,12 +526,12 @@ void printHand(const Card *hand) {
  * - 如果不合法，就請玩家重選
  */
 int playerPlayHand(GameState *game, Card *played, int *playedCount) {
-    printHand(game->hand);
+    int selected[HAND_SIZE] = {0};
+    printHandBoxedSelected(game->hand, selected);
 
     int count;
     printf("你想出幾張牌？(可出 1 / 2 / 5，輸入 0 結束回合): ");
     if (scanf("%d", &count) != 1 || count < 0 || count > 5) {
-        printf("輸入錯誤，這一回合作廢。\n");
         return 0;
     }
 
@@ -370,22 +545,21 @@ int playerPlayHand(GameState *game, Card *played, int *playedCount) {
         int idx;
 
         if (scanf("%d", &idx) != 1) {
-            printf("輸入不是數字，這一回合作廢。\n");
             return 0;
         }
 
         if (idx < 0 || idx >= HAND_SIZE) {
-            printf("索引超出範圍，這一回合作廢。\n");
             return 0;
         }
 
         if (used[idx]) {
-            printf("同一張牌不能選兩次，這一回合作廢。\n");
             return 0;
         }
 
         used[idx] = 1;
         played[i] = game->hand[idx];
+        selected[idx] = 1;
+        printHandBoxedSelected(game->hand, selected);
     }
 
     /* 先檢查這一手牌是不是合法牌型 */
@@ -528,52 +702,34 @@ const char *handTypeName(HandType type) {
 
 const char *suitSymbol(int s) {
     switch (s) {
-        case 0: return "♠"; // Spade
-        case 1: return "♥"; // Heart
-        case 2: return "♣"; // Club
-        case 3: return "♦"; // Diamond
+        case 0: return "♠";
+        case 1: return "♥";
+        case 2: return "♣";
+        case 3: return "♦";
         default: return "?";
     }
 }
 
-double evaluateHand(Card *played, int playedCount, const GameState *game) {
-    if (playedCount <= 0) {
-        printf("這回合沒有出牌，沒有得分。\n");
-        return 0.0;
-    }
+double evaluateHand(Card *played, int playedCount, const GameState *game, int *outHasBoost) {
+    if (outHasBoost) *outHasBoost = 0;
 
-    if (playedCount > 5) {
-        printf("目前規則只支援最多出 5 張牌來組合牌型，這次不計分。\n");
-        return 0.0;
-    }
+    if (playedCount <= 0) return 0.0;
+    if (playedCount > 5)  return 0.0;
 
     HandType type = classifyHand(played, playedCount);
-    if (type == HAND_INVALID) {
-        printf("你出的牌不是合法牌型，這回合不計分。\n");
-        return 0.0;
-    }
-    
-    double baseScore = 0.0;
+    if (type == HAND_INVALID) return 0.0;
+
     double finalScore = 0.0;
 
-    /* 根據牌型 + 當前關卡，決定實際得分（未套用 Card Multiplier 前） */
     if (type == HAND_SINGLE) {
-        baseScore  = 1.0;                 // 原始定義的 base（老師表格）
-        finalScore = game->singleScore;   // 這一關實際給的分數
+        finalScore = game->singleScore;
     } else if (type == HAND_PAIR) {
-        baseScore  = 2.0;
         finalScore = game->pairScore;
     } else {
-        // 其他牌型分數在所有關卡都一樣，用 handTypeBaseScore
-        baseScore  = handTypeBaseScore(type);
-        finalScore = baseScore;
+        finalScore = handTypeBaseScore(type);
     }
 
-    printf("你出的牌型是：%s\n", handTypeName(type));
-    printf("基本分（題目要求的最低分）：%.1f\n", baseScore);
-    printf("依照第 %d 關規則，牌型原始得到：%.1f 分。\n", game->level, finalScore);
-
-    /* === Card Multiplier：檢查這手牌是否含有被強化的點數 === */
+    // Card Multiplier：檢查是否有被強化的 rank
     int hasBoostRank = 0;
     for (int i = 0; i < playedCount; i++) {
         int r = played[i].rank;
@@ -584,30 +740,39 @@ double evaluateHand(Card *played, int playedCount, const GameState *game) {
     }
 
     if (hasBoostRank) {
-        printf("此手牌中包含「已被 Card Multiplier 強化」的點數，分數 x1.5！\n");
-        finalScore *= 1.5;   // 簡單乘 1.5
+        finalScore *= 1.5;
+        if (outHasBoost) *outHasBoost = 1;
     }
 
-    printf("套用 Card Multiplier 後，此手牌小計：%.1f 分（尚未套用 Combo）。\n", finalScore);
-    return finalScore;
+    return finalScore; // 回傳：尚未套用 Combo 的分數
 }
 
 void applySuitChangeMagic(GameState *game) {
     printf("\n=== Suit Change Magic Card ===\n");
     printf("你可以把手牌中「一張牌」的花色改成你指定的花色。\n");
+
+    /* --- A) 選要改的那張牌（用手牌框框 + 黃框） --- */
+    int selected[HAND_SIZE] = {0};
     printf("目前你的起手牌是：\n");
-    printHand(game->hand);
+    printHandBoxedSelected(game->hand, selected);
 
     int idx;
     printf("請輸入要改花色的牌的 index（0 ~ %d）：", HAND_SIZE - 1);
     if (scanf("%d", &idx) != 1 || idx < 0 || idx >= HAND_SIZE) {
         printf("輸入錯誤，Suit Change 魔法作廢。\n");
-        game->hasSuitChange = 0;  // 用掉了（即使失敗也不重來，程式簡化）
+        game->hasSuitChange = 0;
         return;
     }
 
-    printf("請選擇新的花色：\n");
-    printf(" 0: ♠  1: ♥  2: ♣  3: ♦\n");
+    // 亮黃框顯示你選到的那張
+    for(int i=0;i<HAND_SIZE;i++) selected[i]=0;
+    selected[idx] = 1;
+    printf("\n你選擇要改的牌是：\n");
+    printHandBoxedSelected(game->hand, selected);
+
+    /* --- B) 選新花色（4 個花色框框 + 黃框） --- */
+    printf("\n請選擇新的花色（輸入 0~3）：\n");
+    printSuitOptionsBoxed(-1);
 
     int newSuit;
     printf("輸入花色編號：");
@@ -617,14 +782,22 @@ void applySuitChangeMagic(GameState *game) {
         return;
     }
 
+    // 亮黃框顯示你選到的花色
+    printf("\n你選擇的新花色是：\n");
+    printSuitOptionsBoxed(newSuit);
+
     int oldSuit = game->hand[idx].suit;
     game->hand[idx].suit = newSuit;
 
-    printf("已將第 %d 張牌的花色從 %s 改成 %s。\n", idx, suitSymbol(oldSuit), suitSymbol(newSuit));
-    printf("修改後的手牌：\n");
-    printHand(game->hand);
+    printf("\n已將第 %d 張牌的花色從 ", idx);
+    printf("%s%s%s", suitColor(oldSuit), suitSymbol(oldSuit), C_RESET);
+    printf(" 改成 ");
+    printf("%s%s%s。\n", suitColor(newSuit), suitSymbol(newSuit), C_RESET);
 
-    game->hasSuitChange = 0;  // 這張 Suit Change 魔法已經用掉了
+    printf("修改後的手牌：\n");
+    printHandBoxed(game->hand);
+
+    game->hasSuitChange = 0;  // 用掉
 }
 
 void tryUseDrawBoost(GameState *game) {
@@ -651,11 +824,7 @@ void tryUseDrawBoost(GameState *game) {
 
     printf("\n=== Draw Boost 發動！===\n");
     printf("從牌堆抽出 3 張牌：\n");
-    for (int i = 0; i < 3; i++) {
-        printf("  [%d] ", i);
-        printCard(&candidates[i]);
-        printf("\n");
-    }
+    print3CardsBoxed(candidates);
 
     int pick;
     printf("請選擇你要留下的牌（輸入 0~2）：");
@@ -667,7 +836,7 @@ void tryUseDrawBoost(GameState *game) {
     }
 
     printf("\n你目前的手牌為：\n");
-    printHand(game->hand);
+    printHandBoxed(game->hand);
 
     int replaceIndex;
     printf("請選擇要被替換掉的手牌 index（0 ~ %d）：", HAND_SIZE - 1);
@@ -734,7 +903,7 @@ void shopSystem(GameState *game) {
     const int COST_REDRAW = 20;
 
     while (1) {
-        printf("\n你目前 Gold：%d\n", game->gold);
+        printf("\n你目前 %sGold：%d%s\n", C_YELLOW, game->gold, C_RESET);
         printf("你可以選擇購買：\n");
         printf(" [1] Draw Boost（%d Gold）\n", COST_DRAW);
         printf("     效果：下一次回合可抽 3 選 1，替換手牌一次（每輪遊戲最多用一次、不能囤兩張）\n\n");
@@ -769,7 +938,7 @@ void shopSystem(GameState *game) {
                 continue;
             }
             if (game->gold < COST_DRAW) {
-                printf("\nGold 不足！需要 %d，但你只有 %d。\n", COST_DRAW, game->gold);
+                printf("%s%s\nGold 不足！需要 %d，但你只有 %d。%s\n", C_RED, C_BOLD, COST_DRAW, game->gold, C_RESET);
                 continue;
             }
             game->gold -= COST_DRAW;
@@ -780,7 +949,7 @@ void shopSystem(GameState *game) {
 
         if (choice == 2) {
             if (game->gold < COST_MULTI) {
-                printf("\nGold 不足！需要 %d，但你只有 %d。\n", COST_MULTI, game->gold);
+                printf("%s%s\nGold 不足！需要 %d，但你只有 %d。%s\n", C_RED, C_BOLD, COST_MULTI, game->gold, C_RESET);
                 continue;
             }
 
@@ -811,7 +980,7 @@ void shopSystem(GameState *game) {
                 continue;
             }
             if (game->gold < COST_REDRAW) {
-                printf("\nGold 不足！需要 %d，但你只有 %d。\n", COST_REDRAW, game->gold);
+                printf("%s%s\nGold 不足！需要 %d，但你只有 %d。%s\n", C_RED, C_BOLD, COST_REDRAW, game->gold, C_RESET);
                 continue;
             }
             game->gold -= COST_REDRAW;
@@ -875,11 +1044,11 @@ int playLevel(GameState *game) {
     printf("目前牌堆位置：%d / %d\n\n", game->deckIndex, NUM_CARDS);
 
     while (1) {
-        printf("\n目前分數：%.1f  |  目前 Gold：%d\n", game->score, game->gold);
-
+        printf("\n目前分數：%.1f  |  目前 %sGold：%d%s\n",
+        game->score, C_YELLOW, game->gold, C_RESET);
         if (game->comboCount > 1) {
             double comboMultiplier = 1.0 + 0.15 * (game->comboCount - 1);
-            printf("當前 Combo：%d 連擊，倍率 x%.2f\n", game->comboCount, comboMultiplier);
+            printf("%s%s當前 Combo：%d 連擊，倍率 x%.2f%s\n", C_MAG, C_BOLD, game->comboCount, comboMultiplier, C_RESET);
         } else if (game->comboCount == 1) {
             printf("當前 Combo：1 連擊（尚未加成）\n");
         } else {
@@ -887,13 +1056,22 @@ int playLevel(GameState *game) {
         }
 
         if (game->score >= game->target) {
-            printf("恭喜！你已達成目標分數，通過第 %d 關！\n", game->level);
+            printf("%s%s恭喜！你已達成目標分數，通過第 %d 關！%s\n", C_GREEN, C_BOLD, game->level, C_RESET);
             printf("你在本關總共出了 %d 手牌。\n", game->handsUsed);
+            if (game->level == 5){
+                playSound("sounds/遊戲最後一關成功.mp3");
+                usleep(1200000);
+            }else {
+                playSound("sounds/遊戲成功.mp3");
+                usleep(900000);
+            }
             return 1;   // 用 1 代表「這一關過關」
         }
 
         if (game->deckIndex >= NUM_CARDS) {
-            printf("牌堆用完了，但分數還沒達到目標，遊戲失敗 QQ\n");
+            printf("%s%s牌堆用完了，但分數還沒達到目標，遊戲失敗 QQ%s\n", C_RED, C_BOLD, C_RESET);
+            playSound("sounds/遊戲失敗.mp3");
+            usleep(1200000);
             return 0;   // 用 0 代表「這一關失敗」
         }
 
@@ -916,7 +1094,7 @@ int playLevel(GameState *game) {
                     }
 
                     printf("已重抽整手牌！新的手牌為：\n");
-                    printHand(game->hand);
+                    printHandBoxed(game->hand);
                     continue; // 用新手牌重新考慮
                 }
             }
@@ -939,35 +1117,62 @@ int playLevel(GameState *game) {
         int ok = playerPlayHand(game, played, &playedCount);
         if (!ok || playedCount == 0) {
             printf("你這回合沒有成功出牌。\n");
+            playSound("sounds/出牌失敗.mp3");
+            usleep(900000);   // 0.8 秒，和你成功音效節奏一致
             game->comboCount = 0;   // 出牌失敗 → 連擊中斷
             continue;
         }
+        playSound("sounds/出牌成功.mp3");
+        usleep(900000); 
         
-        double gain = evaluateHand(played, playedCount, game);
-
-        // 再判斷一次這手的牌型（用來決定 combo）
+        int hasBoost = 0;
         HandType type = classifyHand(played, playedCount);
-        
+
+        // 先算：尚未套用 Combo 的 base gain（但已包含 x1.5 multiplier）
+        double baseGain = evaluateHand(played, playedCount, game, &hasBoost);
+
+        double gain = baseGain;      // 之後可能套 combo
+        double comboMult = 1.0;
+        int brokeCombo = 0;
+
+        // Combo 規則
         if (type == HAND_SINGLE) {
-            printf("這手是 Single，combo 中斷。\n");
             game->comboCount = 0;
+            brokeCombo = 1;
         } else {
             game->comboCount++;
-
-            double multiplier = 1.0 + 0.15 * (game->comboCount - 1);
-            printf("Combo %d 連擊，倍率 x%.2f\n", game->comboCount, multiplier);
-
-            gain *= multiplier;
-            printf("套用 Combo 後，本回合實際加到總分的分數是：%.1f 分。\n", gain);
+            comboMult = 1.0 + 0.15 * (game->comboCount - 1);
+            gain *= comboMult;
         }
 
+        // 更新總分
         game->score += gain;
 
-        // 把 gain 轉成 Gold（整數部分）
-        int earnGold = (int)gain;  // 直接無條件捨去
-        if (earnGold < 0) earnGold = 0;  // 理論上不會 <0，只是保險
+        // Gold
+        int earnGold = (int)gain;
+        if (earnGold < 0) earnGold = 0;
         game->gold += earnGold;
-        printf("本回合同步獲得 Gold：+%d（目前總 Gold：%d）\n", earnGold, game->gold);
+
+        /* ===== 回合結算面板 ===== */
+        printf("\n%s───────── 回合結算 ─────────%s\n", C_BOLD, C_RESET);
+        printf("牌型：%s\n", handTypeName(type));
+        printf("本回合小計（未套 Combo)：%.1f\n", baseGain);
+
+        if (hasBoost) {
+            printf("Card Multiplier：%s已觸發(x1.5)%s\n", C_YELLOW, C_RESET);
+        }
+
+        if (brokeCombo) {
+            printf("Combo：中斷(Single)\n");
+        } else {
+            printf("Combo：%d 連擊，倍率 x%.2f\n", game->comboCount, comboMult);
+        }
+
+        printf("本回合實得分：%s+%.1f%s\n", C_GREEN, gain, C_RESET);
+        printf("Gold：%s+%d%s（總額： %s%d%s）\n", C_YELLOW, earnGold, C_RESET, C_YELLOW, game->gold, C_RESET);
+        printf("%s────────────────────────────%s\n", C_BOLD, C_RESET);
+
+        waitEnter();
 
         game->handsUsed++;  // 成功出了一手牌，計數 +1
 
