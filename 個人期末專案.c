@@ -295,6 +295,7 @@ void setupLevel(GameState *game, int level) {
     game->handsUsed = 0;  // 重設本關的出牌次數
     game->comboCount  = 0;  // 每一關開始時，連擊歸零
     game->redrawUsedThisLevel = 0;
+    game->drawBoostUsed = 0;
 }
 
 void initDeck(Card *deck) {
@@ -515,7 +516,6 @@ void printHand(const Card *hand) {
 
 /*
  * 玩家出牌
- * 現在版本很簡單：
  * 1. 顯示手牌
  * 2. 問玩家要出幾張牌（例如輸入 1, 2, 5...）
  * 3. 一個一個輸入 index，把那幾張牌複製到 played[]
@@ -527,6 +527,8 @@ void printHand(const Card *hand) {
  */
 int playerPlayHand(GameState *game, Card *played, int *playedCount) {
     int selected[HAND_SIZE] = {0};
+
+    // 只印一次手牌（不要每選一張就重印）
     printHandBoxedSelected(game->hand, selected);
 
     int count;
@@ -536,42 +538,54 @@ int playerPlayHand(GameState *game, Card *played, int *playedCount) {
     }
 
     if (count == 0) {
-        return 0; // 暫時視為玩家不出牌
+        return 0;
     }
 
-    int used[HAND_SIZE] = {0};   // 用來記錄某個 index 有沒有被選過（避免重複）
-    printf("請依序輸入要出的牌的 index（例如：0 1 3）：");
+    int used[HAND_SIZE] = {0};
+
     for (int i = 0; i < count; i++) {
         int idx;
-
-        if (scanf("%d", &idx) != 1) {
-            return 0;
-        }
+        printf("請輸入第 %d 張要出的牌 index：", i + 1);
+        if (scanf("%d", &idx) != 1) return 0;
 
         if (idx < 0 || idx >= HAND_SIZE) {
+            printf("%s輸入超出範圍，回合作廢。%s\n", C_RED, C_RESET);
             return 0;
         }
-
         if (used[idx]) {
+            printf("%s這張牌你已經選過了，回合作廢。%s\n", C_RED, C_RESET);
             return 0;
         }
 
         used[idx] = 1;
-        played[i] = game->hand[idx];
         selected[idx] = 1;
-        printHandBoxedSelected(game->hand, selected);
+        played[i] = game->hand[idx];
+
+        // 不重印整副牌，只給 feedback
+        printf("已選：[%d] ", idx);
+        printCard(&game->hand[idx]);
+        printf("\n");
+
+        printf("目前已選 index：");
+        for (int k = 0; k < HAND_SIZE; k++) {
+            if (selected[k]) printf("[%d] ", k);
+        }
+        printf("\n");
     }
 
-    /* 先檢查這一手牌是不是合法牌型 */
+    // 最後一次再印高亮確認（印一次就好）
+    printf("\n%s你本回合選到的牌（高亮確認）：%s\n", C_BOLD, C_RESET);
+    printHandBoxedSelected(game->hand, selected);
+
+    // 牌型合法性檢查
     HandType type = classifyHand(played, count);
     if (type == HAND_INVALID) {
-        printf("這不是合法的牌型，這一回合作廢。\n");
+        printf("%s這不是合法的牌型，這一回合作廢。%s\n", C_RED, C_RESET);
         return 0;
     }
 
-    // 走到這裡代表：輸入合法 + 牌型合法
     *playedCount = count;
-    return 1; // 表示成功選了一手牌
+    return 1;
 }
 
 /* 用 rank 對牌做由小到大的排序（非常單純的 bubble sort） */
@@ -810,9 +824,6 @@ void tryUseDrawBoost(GameState *game) {
     // 檢查牌堆是否還夠抽 3 張
     if (game->deckIndex + 3 > NUM_CARDS) {
         printf("牌堆剩餘牌數不足，無法使用 Draw Boost。\n");
-        // 規則簡化：就算失敗也當作用掉
-        game->hasDrawBoost  = 0;
-        game->drawBoostUsed = 1;
         return;
     }
 
@@ -829,9 +840,7 @@ void tryUseDrawBoost(GameState *game) {
     int pick;
     printf("請選擇你要留下的牌（輸入 0~2）：");
     if (scanf("%d", &pick) != 1 || pick < 0 || pick >= 3) {
-        printf("輸入錯誤，Draw Boost 作廢。\n");
-        game->hasDrawBoost  = 0;
-        game->drawBoostUsed = 1;
+        printf("輸入錯誤，Draw Boost 取消。\n");
         return;
     }
 
@@ -842,9 +851,7 @@ void tryUseDrawBoost(GameState *game) {
     printf("請選擇要被替換掉的手牌 index（0 ~ %d）：", HAND_SIZE - 1);
     if (scanf("%d", &replaceIndex) != 1 ||
         replaceIndex < 0 || replaceIndex >= HAND_SIZE) {
-        printf("輸入錯誤，Draw Boost 作廢。\n");
-        game->hasDrawBoost  = 0;
-        game->drawBoostUsed = 1;
+        printf("輸入錯誤，Draw Boost 取消。\n");
         return;
     }
 
@@ -906,13 +913,13 @@ void shopSystem(GameState *game) {
         printf("\n你目前 %sGold：%d%s\n", C_YELLOW, game->gold, C_RESET);
         printf("你可以選擇購買：\n");
         printf(" [1] Draw Boost（%d Gold）\n", COST_DRAW);
-        printf("     效果：下一次回合可抽 3 選 1，替換手牌一次（每輪遊戲最多用一次、不能囤兩張）\n\n");
+        printf("     效果：下一次回合可抽 3 選 1，替換手牌一次（每關最多一次、不能囤多張）\n\n");
 
         printf(" [2] Card Multiplier（%d Gold）\n", COST_MULTI);
         printf("     效果：隨機強化一個 rank，之後出牌含該 rank → 該手分數 x1.5（永久）\n\n");
 
         printf(" [3] Redraw（%d Gold）\n", COST_REDRAW);
-        printf("     效果：本關可重抽整手牌一次（不扣分、不能囤多張）\n\n");
+        printf("     效果：本關可重抽整手牌一次（每關最多一次、不能囤多張）\n\n");
 
         printf(" [0] 離開商店\n\n");
 
@@ -929,10 +936,6 @@ void shopSystem(GameState *game) {
         }
 
         if (choice == 1) {
-            if (game->drawBoostUsed) {
-                printf("\n⚠ 這一輪遊戲你已經使用過 Draw Boost，不能再買。\n");
-                continue;
-            }
             if (game->hasDrawBoost) {
                 printf("\n⚠ 你已經持有尚未使用的 Draw Boost，不能再買一張。\n");
                 continue;
